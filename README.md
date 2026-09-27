@@ -18,8 +18,8 @@
 1. Заполнить `.env` по образцу `.env.example`.
 2. `uv sync`
 3. `scripts/run.sh` — тестовый бот (@audience_topic_inbox_bot) в tmux-сессии `streaming-poll-tg-bot`
-4. Продакшн (@el_ping_bot): токен и своя база в `~/.config/streaming-poll-tg-bot/prod.env`;
-   деплой = закоммитить и `scripts/run.sh prod` (сессия `streaming-poll-tg-bot-prod`)
+4. Продакшн (@el_ping_bot) = ветка `master`: слить изменения в master и `scripts/deploy.sh`
+   (токен и своя база — в `~/.config/streaming-poll-tg-bot/prod.env`). Процесс — в `CLAUDE.md`.
 
 Смотреть лог: `tmux attach -t streaming-poll-tg-bot` (выйти: Ctrl-b, затем d)
 
