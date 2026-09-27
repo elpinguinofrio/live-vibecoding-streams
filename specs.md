@@ -31,6 +31,7 @@ Don't do automatic thumbs up like never. And admin, like by default, have abilit
 
 - Start as @real_turkish_wolf and @lebed2045; managed with `/admins`, `/addadmin`, `/removeadmin` (id or @username). The last admin can't be removed.
 - Every new suggestion → a notification to all admins: type emoji + sender. Messages from one person within 15 s → one notification.
+- Each notification starts with the global suggestion number(s) — #7, #13–16 — the same message always shows the same number.
 - Short text (≤ 500 chars) → shown as is. Long → what was sent and its size, then a 1–3 sentence TLDR.
 - Each notification shows a draft reply and quick buttons:
   - a reaction the model picked for this message (🔥, 🤔, 👍…) — puts it on the person's message.

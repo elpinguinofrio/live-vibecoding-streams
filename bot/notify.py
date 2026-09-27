@@ -46,6 +46,7 @@ class _Burst:
     texts: list[str] = field(default_factory=list)
     message_ids: list[int] = field(default_factory=list)
     durations: list[int] = field(default_factory=list)
+    suggestion_ids: list[int] = field(default_factory=list)
     timer: asyncio.Task | None = None
 
 
@@ -56,6 +57,14 @@ def _types_label(kinds: list[str]) -> str:
         icon, name = KIND_LABELS[kind]
         parts.append(f"{icon} [{name} ×{counts[kind]}]" if counts[kind] > 1 else f"{icon} [{name}]")
     return " ".join(parts)
+
+
+def _ids_label(ids: list[int]) -> str:
+    """Global suggestion numbers, so a message seen twice is recognisable: #7, #13–16, #3, #9."""
+    ids = sorted(ids)
+    if len(ids) > 1 and ids == list(range(ids[0], ids[-1] + 1)):
+        return f"#{ids[0]}–{ids[-1]}"
+    return ", ".join(f"#{i}" for i in ids)
 
 
 def _size_line(burst: _Burst) -> str:
@@ -83,12 +92,13 @@ class Notifier:
         self._flushing: set[asyncio.Task] = set()
 
     async def add(self, bot: Bot, *, chat_id: int, sender: str, kind: str, text: str, message_id: int,
-                  duration: int | None = None) -> None:
+                  suggestion_id: int, duration: int | None = None) -> None:
         burst = self._bursts.setdefault(chat_id, _Burst(bot, chat_id, sender))
         burst.kinds.append(kind)
         burst.texts.append(text.strip())
         burst.message_ids.append(message_id)
         burst.durations.append(duration or 0)
+        burst.suggestion_ids.append(suggestion_id)
         if self._burst_s <= 0:
             await self._send(self._bursts.pop(chat_id))
             return
@@ -133,7 +143,7 @@ class Notifier:
                 body = _size_line(burst) + (f"TLDR: {tldr}" if tldr else truncate_utf16(combined, VERBATIM_LIMIT))
             emoji = (assist.emoji if assist else "") or DEFAULT_REACTION
             draft = (assist.reply if assist else "") or None
-            note = texts.NEW_SUGGESTION.format(types=_types_label(burst.kinds), sender=burst.sender, body=body,
+            note = texts.NEW_SUGGESTION.format(ids=_ids_label(burst.suggestion_ids), types=_types_label(burst.kinds), sender=burst.sender, body=body,
                                                draft=texts.DRAFT.format(reply=draft) if draft else "")
             admin_ids = await self._storage.admin_ids()
         except Exception as exc:

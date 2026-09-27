@@ -166,4 +166,4 @@ class Intake:
                 pass
         if inserted_id is not None:
             await self._notifier.add(bot, chat_id=job.chat_id, sender=job.sender, kind=job.kind, text=text,
-                                     message_id=job.message_id, duration=job.duration)
+                                     message_id=job.message_id, suggestion_id=inserted_id, duration=job.duration)
