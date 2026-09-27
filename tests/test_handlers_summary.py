@@ -4,7 +4,7 @@ from tests.conftest import AUTHOR_ID, VIEWER_ID, FakeSpeech, FakeSummarizer, mak
 
 
 def _dp(storage, summarizer):
-    return create_dispatcher(storage=storage, speech=FakeSpeech(), summarizer=summarizer, author_id=AUTHOR_ID)
+    return create_dispatcher(storage=storage, speech=FakeSpeech(), summarizer=summarizer)
 
 
 async def _seed(storage):
@@ -42,7 +42,7 @@ async def test_non_author_refused(bot, session, storage):
     summarizer = FakeSummarizer()
     await _dp(storage, summarizer).feed_update(bot, make_update(user_id=VIEWER_ID, text="/summary"))
     assert summarizer.calls == []
-    assert session.sent_texts() == [texts.NOT_AUTHOR]
+    assert session.sent_texts() == [texts.NOT_ADMIN]
 
 
 async def test_summary_error(bot, session, storage):
@@ -54,10 +54,11 @@ async def test_summary_error(bot, session, storage):
 async def test_summary_refused_when_author_not_configured(bot, session, storage):
     await _seed(storage)
     summarizer = FakeSummarizer()
-    dp = create_dispatcher(storage=storage, speech=FakeSpeech(), summarizer=summarizer, author_id=None)
+    await storage._conn().execute("DELETE FROM admins")
+    dp = create_dispatcher(storage=storage, speech=FakeSpeech(), summarizer=summarizer)
     await dp.feed_update(bot, make_update(user_id=AUTHOR_ID, text="/summary"))
     assert summarizer.calls == []
-    assert session.sent_texts() == [texts.NOT_AUTHOR]
+    assert session.sent_texts() == [texts.NOT_ADMIN]
 
 
 from bot.handlers import Limits
@@ -72,8 +73,7 @@ async def test_summary_db_read_failure(bot, session, storage):
 
 async def test_summary_timeout(bot, session, storage):
     await _seed(storage)
-    dp = create_dispatcher(storage=storage, speech=FakeSpeech(), summarizer=FakeSummarizer(delay=1),
-                           author_id=AUTHOR_ID, limits=Limits(summary_timeout_s=0.05))
+    dp = create_dispatcher(storage=storage, speech=FakeSpeech(), summarizer=FakeSummarizer(delay=1), limits=Limits(summary_timeout_s=0.05))
     await dp.feed_update(bot, make_update(user_id=AUTHOR_ID, text="/summary"))
     assert session.sent_texts() == [texts.SUMMARY_TIMEOUT]
 

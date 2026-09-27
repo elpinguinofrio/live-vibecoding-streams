@@ -1,26 +1,30 @@
 import asyncio
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
-from io import BytesIO
 from typing import Protocol
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ChatType
-from aiogram.filters import Command, CommandStart
-from aiogram.types import Message, ReactionTypeEmoji
+from aiogram.filters import Command, CommandObject, CommandStart
+from aiogram.types import CallbackQuery, Message, ReactionTypeEmoji, ReplyParameters
 
 from bot import texts
-from bot.storage import Storage
-from bot.summary import split_message, truncate_utf16
+from bot.commands import hide_admin_menu, show_admin_menu
+from bot.intake import OK_HAND, Intake, Job, Speech
+from bot.notify import Notifier, keyboard
+from bot.storage import Notification, Storage
+from bot.summary import Assist, split_message
 from bot.version import get_version
 from bot.voice_archive import VoiceArchive
 
 log = logging.getLogger(__name__)
 
-THUMBS_UP = [ReactionTypeEmoji(emoji="👍")]
-KIND_ICONS = {"text": "💬", "voice": "🎙"}
-NOTIFY_TEXT_LIMIT = 3500  # leaves room for the header within Telegram's 4096 UTF-16 units
+# Header of notifications sent before replies were tracked: "🆕 Новое предложение 💬 от @x (id 123):".
+# Anchored at the end of the first line, so an "(id N)" inside a sender's full name can't redirect replies.
+_LEGACY_HEADER = re.compile(r"^🆕 Новое предложение .* \(id (\d+)\):$")
+_LEGACY_MATCH_CHARS = 100
 
 
 @dataclass(frozen=True)
@@ -29,16 +33,16 @@ class Limits:
     stt_concurrency: int = 4
     stt_timeout_s: float = 30.0
     summary_timeout_s: float = 90.0
-
-
-class Speech(Protocol):
-    model: str
-
-    async def transcribe(self, data: bytes, filename: str) -> str: ...
+    burst_s: float = 15.0  # messages from one person this close together become one admin notification
+    tldr_timeout_s: float = 30.0
+    stt_retry_s: float = 10.0  # failed transcription/save: retry silently this often
+    stt_max_attempts: int = 30  # ~5 min, then saved anyway as «не удалось распознать»
 
 
 class Summarizer(Protocol):
     async def summarize(self, texts: list[str]) -> str: ...
+
+    async def assist(self, text: str) -> Assist: ...
 
 
 def _display_name(message: Message) -> str | None:
@@ -63,50 +67,157 @@ def _sender_label(message: Message) -> str:
     return f"{handle} (id {user.id})"
 
 
-async def _notify_author(bot: Bot, author_id: int | None, message: Message, kind: str, text: str) -> None:
-    if author_id is None:
-        return
-    note = texts.NEW_SUGGESTION.format(icon=KIND_ICONS[kind], sender=_sender_label(message),
-                                       text=truncate_utf16(text.strip(), NOTIFY_TEXT_LIMIT))
+def _admin_label(user_id: int, username: str | None) -> str:
+    return f"@{username} (id {user_id})" if username else f"id {user_id}"
+
+
+async def _is_admin(message: Message, storage: Storage, failed_text: str) -> bool:
     try:
-        await bot.send_message(author_id, note)
+        if await storage.is_admin(message.from_user.id):
+            return True
+    except Exception as exc:  # the sender may well be an admin: report the failure, not a refusal
+        log.error("failed to check admin: %s", type(exc).__name__)
+        await _answer_safely(message, failed_text)
+        return False
+    await _answer_safely(message, texts.NOT_ADMIN)
+    return False
+
+
+def _is_command(message: Message, name: str) -> bool:
+    words = (message.text or "").split()
+    return bool(words) and words[0].split("@")[0] == f"/{name}"
+
+
+async def _legacy_notification(storage: Storage, reply: Message, bot: Bot) -> Notification | None:
+    """Rebuild the target of an old notification from its text: sender id from the header, originals by text."""
+    if reply.from_user is None or reply.from_user.id != bot.id or not reply.text:
+        return None
+    match = _LEGACY_HEADER.match(reply.text.split("\n", 1)[0])
+    if match is None:
+        return None
+    user_id = int(match.group(1))
+    sources = [s.message_id for s in await storage.list_by_user(user_id)
+               if s.chat_id == user_id and s.text[:_LEGACY_MATCH_CHARS] in reply.text]
+    return Notification(user_chat_id=user_id, source_message_ids=sources)
+
+
+async def _notification_reply(message: Message, storage: Storage, bot: Bot) -> dict | bool:
+    """Filter: an admin replying to one of the bot's suggestion notifications."""
+    reply = message.reply_to_message
+    if reply is None:
+        return False
+    try:
+        notification = (await storage.get_notification(message.chat.id, reply.message_id)
+                        or await _legacy_notification(storage, reply, bot))
+        if notification is None or not await storage.is_admin(message.from_user.id):
+            return False
     except Exception as exc:
-        log.error("failed to notify author: %s", type(exc).__name__)
+        log.error("failed to look up notification: %s", type(exc).__name__)
+        return False
+    return {"notification": notification}
 
 
-class _ArchiveError(Exception):
-    pass
-
-
-async def _save_and_ack(message: Message, storage: Storage, kind: str, text: str,
-                        bot: Bot, author_id: int | None, **voice_fields: str) -> None:
+async def _admin_plain_message(message: Message, storage: Storage) -> dict | bool:
+    """Filter: an admin's ordinary message (not a command) — an answer to the person of their latest notification."""
+    if (message.text or "").startswith("/"):
+        return False
     try:
-        inserted_id = await storage.add(
-            user_id=message.from_user.id,
-            username=_display_name(message),
-            kind=kind,
-            text=text,
-            chat_id=message.chat.id,
-            message_id=message.message_id,
-            **voice_fields,
-        )  # None means an already-stored duplicate delivery: still persisted, so still acknowledged
-    except Exception as exc:  # log type only: messages may carry URLs with secrets
-        log.error("failed to save %s suggestion: %s", kind, type(exc).__name__)
-        await _answer_safely(message, texts.SAVE_FAILED)
+        if not await storage.is_admin(message.from_user.id):
+            return False
+        return {"notification": await storage.latest_notification(message.chat.id)}
+    except Exception as exc:
+        log.error("failed to look up latest notification: %s", type(exc).__name__)
+        return False
+
+
+async def _relay(message: Message, bot: Bot, notification: Notification) -> None:
+    try:  # copy, not forward: the person sees the bot, never the admin
+        await bot.copy_message(
+            chat_id=notification.user_chat_id, from_chat_id=message.chat.id, message_id=message.message_id,
+            reply_parameters=ReplyParameters(message_id=notification.source_message_ids[-1],
+                                             allow_sending_without_reply=True)
+            if notification.source_message_ids else None,
+        )
+    except Exception as exc:
+        log.error("failed to relay admin reply: %s", type(exc).__name__)
+        await _answer_safely(message, texts.RELAY_FAILED)
         return
     try:
-        await message.react(THUMBS_UP)
-    except Exception as exc:
-        log.error("failed to set reaction: %s", type(exc).__name__)
-        await _answer_safely(message, texts.SAVED_FALLBACK)
-    if inserted_id is not None:
-        await _notify_author(bot, author_id, message, kind, text)
+        await message.react(OK_HAND)
+    except Exception:
+        await _answer_safely(message, texts.RELAY_SENT)
 
 
-def create_router(author_id: int | None, limits: Limits) -> Router:
+def _job(message: Message, kind: str, **fields) -> Job:
+    return Job(chat_id=message.chat.id, message_id=message.message_id, user_id=message.from_user.id,
+               username=_display_name(message), sender=_sender_label(message), kind=kind, **fields)
+
+
+async def _resolve_target(storage: Storage, arg: str | None) -> tuple[int | None, bool]:
+    """Returns (user_id, argument_given)."""
+    arg = (arg or "").strip()
+    if not arg:
+        return None, False
+    if arg.lstrip("-").isdigit():
+        return int(arg), True
+    return await storage.find_user(arg), True
+
+
+def create_router(limits: Limits) -> Router:
     router = Router(name="suggestions")
     router.message.filter(F.chat.type == ChatType.PRIVATE)
-    stt_slots = asyncio.Semaphore(limits.stt_concurrency)
+
+    @router.message(_notification_reply)
+    async def on_notification_reply(message: Message, bot: Bot, notification: Notification) -> None:
+        if _is_command(message, "original"):
+            if not notification.source_message_ids:
+                await _answer_safely(message, texts.ORIGINAL_FAILED)
+                return
+            for source_id in notification.source_message_ids:
+                try:
+                    await bot.copy_message(chat_id=message.chat.id, from_chat_id=notification.user_chat_id,
+                                           message_id=source_id)
+                except Exception as exc:
+                    log.error("failed to copy original: %s", type(exc).__name__)
+                    await _answer_safely(message, texts.ORIGINAL_FAILED)
+                    return
+            return
+        await _relay(message, bot, notification)
+
+    @router.callback_query(F.data.in_({"react", "draft"}))
+    async def on_quick_action(callback: CallbackQuery, bot: Bot, storage: Storage) -> None:
+        try:
+            if not await storage.is_admin(callback.from_user.id):
+                await callback.answer(texts.NOT_ADMIN)
+                return
+            note = callback.message
+            notification = await storage.get_notification(note.chat.id, note.message_id)
+            if notification is None or not notification.source_message_ids:
+                await callback.answer(texts.BUTTON_FAILED)
+                return
+            target = notification.source_message_ids[-1]
+            if callback.data == "react":
+                await bot.set_message_reaction(chat_id=notification.user_chat_id, message_id=target,
+                                               reaction=[ReactionTypeEmoji(emoji=notification.emoji or "👍")])
+                remaining = keyboard(None, notification.draft)
+            else:
+                await bot.send_message(notification.user_chat_id, notification.draft,
+                                       reply_parameters=ReplyParameters(message_id=target,
+                                                                        allow_sending_without_reply=True))
+                remaining = keyboard(notification.emoji, None)
+        except Exception as exc:
+            log.error("quick action %s failed: %s", callback.data, type(exc).__name__)
+            try:
+                await callback.answer(texts.BUTTON_FAILED)
+            except Exception:
+                pass
+            return
+        try:
+            await callback.answer(texts.BUTTON_DONE)
+            await bot.edit_message_reply_markup(chat_id=note.chat.id, message_id=note.message_id,
+                                                reply_markup=remaining)
+        except Exception as exc:
+            log.error("failed to update buttons: %s", type(exc).__name__)
 
     @router.message(CommandStart())
     async def on_start(message: Message) -> None:
@@ -123,8 +234,7 @@ def create_router(author_id: int | None, limits: Limits) -> Router:
 
     @router.message(Command("summary"))
     async def on_summary(message: Message, storage: Storage, summarizer: Summarizer) -> None:
-        if author_id is None or message.from_user.id != author_id:
-            await _answer_safely(message, texts.NOT_AUTHOR)
+        if not await _is_admin(message, storage, texts.SUMMARY_FAILED):
             return
         try:
             async with asyncio.timeout(limits.summary_timeout_s):
@@ -145,44 +255,99 @@ def create_router(author_id: int | None, limits: Limits) -> Router:
             if not await _answer_safely(message, chunk):
                 break
 
-    @router.message(F.text & ~F.text.startswith("/"))
-    async def on_text(message: Message, bot: Bot, storage: Storage) -> None:
-        await _save_and_ack(message, storage, "text", message.text, bot, author_id)
+    @router.message(Command("original"))
+    async def on_original(message: Message, storage: Storage) -> None:
+        if await _is_admin(message, storage, texts.ORIGINAL_FAILED):
+            await _answer_safely(message, texts.ORIGINAL_USAGE)
 
-    @router.message(F.voice)
-    async def on_voice(message: Message, bot: Bot, storage: Storage, speech: Speech,
-                       voice_archive: VoiceArchive) -> None:
-        voice = message.voice
-        if voice.file_size is not None and voice.file_size > limits.max_voice_bytes:
-            await _answer_safely(message, texts.VOICE_TOO_LARGE)
+    @router.message(Command("admins"))
+    async def on_admins(message: Message, storage: Storage) -> None:
+        if not await _is_admin(message, storage, texts.ADMIN_FAILED):
             return
         try:
-            async with stt_slots, asyncio.timeout(limits.stt_timeout_s):
-                buffer = await bot.download(voice, destination=BytesIO())
-                data = buffer.getvalue()
-                try:  # keep the original before transcribing, so it survives STT failures too
-                    voice_path = await voice_archive.save(data, chat_id=message.chat.id,
-                                                          message_id=message.message_id,
-                                                          file_unique_id=voice.file_unique_id)
-                except Exception as exc:
-                    raise _ArchiveError(type(exc).__name__) from exc
-                transcript = await speech.transcribe(data, "voice.ogg")
-        except TimeoutError:
-            log.error("voice transcription timed out")
-            await _answer_safely(message, texts.VOICE_TIMEOUT)
+            admins = await storage.list_admins()
+        except Exception as exc:
+            log.error("failed to list admins: %s", type(exc).__name__)
+            await _answer_safely(message, texts.ADMIN_FAILED)
             return
-        except _ArchiveError as exc:
-            log.error("failed to archive voice: %s", exc)
-            await _answer_safely(message, texts.SAVE_FAILED)
+        lines = "\n".join(f"• {_admin_label(a.user_id, a.username)}" for a in admins)
+        await _answer_safely(message, texts.ADMINS_LIST.format(lines=lines))
+
+    @router.message(Command("addadmin"))
+    async def on_add_admin(message: Message, command: CommandObject, bot: Bot, storage: Storage) -> None:
+        if not await _is_admin(message, storage, texts.ADMIN_FAILED):
             return
-        except Exception as exc:  # download errors can include the token-bearing file URL
-            log.error("voice transcription failed: %s", type(exc).__name__)
-            transcript = ""
-        if not transcript.strip():
-            await _answer_safely(message, texts.VOICE_FAILED)
+        try:
+            user_id, given = await _resolve_target(storage, command.args)
+            if not given:
+                await _answer_safely(message, texts.ADD_ADMIN_USAGE)
+                return
+            if user_id is None:
+                await _answer_safely(message, texts.ADMIN_UNKNOWN_USER)
+                return
+            username = await storage.known_username(user_id)
+            added = await storage.add_admin(user_id, username, added_by=message.from_user.id)
+        except Exception as exc:
+            log.error("failed to add admin: %s", type(exc).__name__)
+            await _answer_safely(message, texts.ADMIN_FAILED)
             return
-        await _save_and_ack(message, storage, "voice", transcript, bot, author_id,
-                            voice_path=voice_path, voice_file_id=voice.file_id, stt_model=speech.model)
+        who = _admin_label(user_id, username)
+        if added:
+            await show_admin_menu(bot, user_id)
+        await _answer_safely(message, (texts.ADMIN_ADDED if added else texts.ADMIN_ALREADY).format(who=who))
+
+    @router.message(Command("removeadmin"))
+    async def on_remove_admin(message: Message, command: CommandObject, bot: Bot, storage: Storage) -> None:
+        if not await _is_admin(message, storage, texts.ADMIN_FAILED):
+            return
+        try:
+            user_id, given = await _resolve_target(storage, command.args)
+            if not given:
+                await _answer_safely(message, texts.REMOVE_ADMIN_USAGE)
+                return
+            if user_id is None:
+                await _answer_safely(message, texts.ADMIN_UNKNOWN_USER)
+                return
+            admin = await storage.get_admin(user_id)
+            result = await storage.remove_admin(user_id)
+        except Exception as exc:
+            log.error("failed to remove admin: %s", type(exc).__name__)
+            await _answer_safely(message, texts.ADMIN_FAILED)
+            return
+        who = _admin_label(user_id, admin.username if admin else None)
+        if result == "removed":
+            await hide_admin_menu(bot, user_id)
+            await _answer_safely(message, texts.ADMIN_REMOVED.format(who=who))
+        elif result == "last":
+            await _answer_safely(message, texts.ADMIN_LAST)
+        else:
+            await _answer_safely(message, texts.ADMIN_MISSING.format(who=who))
+
+    @router.message(_admin_plain_message)
+    async def on_admin_plain(message: Message, bot: Bot, notification: Notification | None) -> None:
+        if notification is None:
+            await _answer_safely(message, texts.ADMIN_NO_TARGET)
+            return
+        await _relay(message, bot, notification)
+
+    @router.message(F.text & ~F.text.startswith("/"))
+    async def on_text(message: Message, bot: Bot, intake: Intake) -> None:
+        await intake.submit(bot, _job(message, "text", text=message.text.strip()))
+
+    @router.message(F.photo)
+    async def on_photo(message: Message, bot: Bot, intake: Intake) -> None:
+        text = (message.caption or "").strip() or texts.NO_CAPTION
+        await intake.submit(bot, _job(message, "photo", text=text, file_id=message.photo[-1].file_id))
+
+    @router.message(F.voice | F.video_note | F.video)
+    async def on_media(message: Message, bot: Bot, intake: Intake) -> None:
+        kind = "voice" if message.voice else "video_note" if message.video_note else "video"
+        media = getattr(message, kind)
+        if media.file_size is not None and media.file_size > limits.max_voice_bytes:
+            await _answer_safely(message, texts.VOICE_TOO_LARGE if kind == "voice" else texts.MEDIA_TOO_LARGE)
+            return
+        await intake.submit(bot, _job(message, kind, caption=message.caption or "", file_id=media.file_id,
+                                      file_unique_id=media.file_unique_id, duration=media.duration))
 
     @router.message()
     async def on_other(message: Message) -> None:
@@ -191,7 +356,7 @@ def create_router(author_id: int | None, limits: Limits) -> Router:
     return router
 
 
-def create_dispatcher(*, storage: Storage, speech: Speech, summarizer: Summarizer, author_id: int | None,
+def create_dispatcher(*, storage: Storage, speech: Speech, summarizer: Summarizer,
                       limits: Limits = Limits(), voice_archive: VoiceArchive | None = None) -> Dispatcher:
     dp = Dispatcher()
     dp["storage"] = storage
@@ -199,5 +364,10 @@ def create_dispatcher(*, storage: Storage, speech: Speech, summarizer: Summarize
     dp["voice_archive"] = voice_archive or VoiceArchive(Path(storage.path).parent / "voices")
     dp["speech"] = speech
     dp["summarizer"] = summarizer
-    dp.include_router(create_router(author_id, limits))
+    dp["notifier"] = notifier = Notifier(storage, summarizer, burst_s=limits.burst_s,
+                                         tldr_timeout_s=limits.tldr_timeout_s)
+    dp["intake"] = Intake(storage, speech, dp["voice_archive"], notifier, concurrency=limits.stt_concurrency,
+                          timeout_s=limits.stt_timeout_s, retry_s=limits.stt_retry_s,
+                          max_attempts=limits.stt_max_attempts)
+    dp.include_router(create_router(limits))
     return dp

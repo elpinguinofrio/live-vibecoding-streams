@@ -1,14 +1,14 @@
 from aiogram.methods import SendMessage, SetMessageReaction
 
 from bot import texts
-from bot.handlers import create_dispatcher
+from bot.handlers import Limits, create_dispatcher
 from bot.summary import utf16_len
 from tests.conftest import AUTHOR_ID, VIEWER_ID, FakeSpeech, FakeSummarizer, make_update
 
 
-def _dp(storage, speech=None, author_id=AUTHOR_ID):
+def _dp(storage, speech=None):
     return create_dispatcher(storage=storage, speech=speech or FakeSpeech(), summarizer=FakeSummarizer(),
-                             author_id=author_id)
+                             limits=Limits(burst_s=0))
 
 
 async def test_text_suggestion_notifies_author_after_reaction(bot, session, storage):
@@ -36,11 +36,13 @@ async def test_failed_save_does_not_notify(bot, session, storage):
     await storage.close()
     await _dp(storage).feed_update(bot, make_update(text="идея"))
     assert session.sent_to(AUTHOR_ID) == []
-    assert session.sent_to(VIEWER_ID) == [texts.SAVE_FAILED]
+    assert session.sent_to(VIEWER_ID) == []
+    await _dp(storage)["intake"].close()
 
 
 async def test_no_author_configured_no_notification(bot, session, storage):
-    await _dp(storage, author_id=None).feed_update(bot, make_update(text="идея"))
+    await storage._conn().execute("DELETE FROM admins")
+    await _dp(storage).feed_update(bot, make_update(text="идея"))
     assert session.calls(SendMessage) == []
     assert len(session.calls(SetMessageReaction)) == 1
 

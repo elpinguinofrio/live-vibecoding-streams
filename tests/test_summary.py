@@ -67,3 +67,33 @@ async def test_reduce_terminates_with_tiny_budget():
     result = await GroqSummarizer(_client(comp), model="m", batch_chars=40, item_chars=10).summarize(items)
     assert result.startswith("RESULT-")
     assert len(comp.calls) < 400
+
+
+class _JsonCompletions(_Completions):
+    def __init__(self, content):
+        super().__init__()
+        self.content = content
+
+    async def create(self, **kwargs):
+        self.calls.append(kwargs)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=self.content))])
+
+
+async def test_assist_one_call_bounded_input_parsed():
+    comp = _JsonCompletions('Вот: {"tldr": "TLDR: про ИИ", "emoji": "🔥", "reply": "Спасибо!"}')
+    result = await GroqSummarizer(_client(comp), model="m").assist("x" * 50000)
+    [call] = comp.calls
+    assert call["model"] == "m" and len(call["messages"][-1]["content"]) < 13000
+    assert "500" in call["messages"][0]["content"]
+    assert (result.tldr, result.emoji, result.reply) == ("про ИИ", "🔥", "Спасибо!")
+
+
+async def test_assist_disallowed_emoji_falls_back_to_thumbs_up():
+    comp = _JsonCompletions('{"tldr": "t", "emoji": "🦖", "reply": "r"}')
+    assert (await GroqSummarizer(_client(comp), model="m").assist("x")).emoji == "👍"
+
+
+async def test_assist_unparseable_answer_is_empty_not_error():
+    comp = _JsonCompletions("не JSON")
+    result = await GroqSummarizer(_client(comp), model="m").assist("x")
+    assert (result.tldr, result.emoji, result.reply) == ("", "👍", "")

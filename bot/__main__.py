@@ -24,13 +24,15 @@ async def main() -> None:
     logging.basicConfig(level=logging.INFO)
     for handler in logging.getLogger().handlers:
         handler.setFormatter(RedactingFormatter(LOG_FORMAT, secrets=[token, api_key]))
-    if settings.author_user_id is None:
-        logging.warning("AUTHOR_USER_ID is not set: /summary is disabled; DM /whoami to the bot to get your id")
-
     async with AsyncExitStack() as stack:
         storage = Storage(settings.db_path)
         await storage.open()
         stack.push_async_callback(storage.close)
+        if await storage.seed_admins(settings.seed_admin_ids()):
+            logging.info("admins seeded from ADMIN_USER_IDS / AUTHOR_USER_ID")
+        admin_ids = await storage.admin_ids()
+        if not admin_ids:
+            logging.warning("no admins: set ADMIN_USER_IDS (DM /whoami to the bot to get an id); /summary is disabled")
 
         # The SDK retries connection errors, 408/409/429 and 5xx with exponential backoff and jitter.
         groq = AsyncGroq(api_key=api_key, timeout=settings.groq_timeout_s, max_retries=settings.groq_max_retries)
@@ -43,7 +45,6 @@ async def main() -> None:
             storage=storage,
             speech=GroqSpeech(groq, settings.groq_stt_model),
             summarizer=GroqSummarizer(groq, settings.groq_summary_model),
-            author_id=settings.author_user_id,
             limits=Limits(
                 max_voice_bytes=settings.max_voice_bytes,
                 stt_concurrency=settings.stt_concurrency,
@@ -51,8 +52,11 @@ async def main() -> None:
                 summary_timeout_s=settings.summary_timeout_s,
             ),
         )
-        await setup_commands(bot, settings.author_user_id)
-        await dp.start_polling(bot, allowed_updates=["message"])
+        stack.push_async_callback(dp["notifier"].close)  # runs before the bot session closes
+        stack.push_async_callback(dp["intake"].close)  # stop retries first; unfinished media stays queued in the DB
+        await dp["intake"].resume(bot)
+        await setup_commands(bot, admin_ids)
+        await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
 
 
 if __name__ == "__main__":

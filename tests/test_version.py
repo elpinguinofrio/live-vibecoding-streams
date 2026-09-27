@@ -27,7 +27,7 @@ def test_version_includes_git_commit_when_available():
 
 
 async def test_version_command_replies_for_anyone_and_is_not_saved(bot, session, storage):
-    dp = create_dispatcher(storage=storage, speech=FakeSpeech(), summarizer=FakeSummarizer(), author_id=AUTHOR_ID)
+    dp = create_dispatcher(storage=storage, speech=FakeSpeech(), summarizer=FakeSummarizer())
     await dp.feed_update(bot, make_update(user_id=VIEWER_ID, text="/version"))
     assert session.sent_texts() == [f"Версия: {get_version()}"]
     assert await storage.count() == 0

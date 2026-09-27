@@ -13,7 +13,7 @@ async def test_add_and_list(storage: Storage):
 
 async def test_rejects_bad_kind(storage: Storage):
     with pytest.raises(ValueError):
-        await storage.add(user_id=5, username="a", kind="photo", text="x", chat_id=5, message_id=1)
+        await storage.add(user_id=5, username="a", kind="sticker", text="x", chat_id=5, message_id=1)
 
 
 async def test_rejects_empty_text(storage: Storage):

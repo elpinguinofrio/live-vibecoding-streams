@@ -2,8 +2,10 @@ import os
 from pathlib import Path
 
 from dotenv import dotenv_values
+from typing import Annotated
+
 from pydantic import SecretStr, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 POINTER_VAR = "SECRETS_ENV_FILES"
 
@@ -13,7 +15,9 @@ class Settings(BaseSettings):
 
     telegram_bot_token: SecretStr
     groq_api_key: SecretStr
-    author_user_id: int | None = None  # unset: /summary refused for everyone; get it via /whoami
+    author_user_id: int | None = None  # legacy single admin; merged into admin_user_ids
+    # First-run admins (comma-separated ids). After that the list lives in the DB, managed via /addadmin, /removeadmin
+    admin_user_ids: Annotated[list[int], NoDecode] = []
     groq_summary_model: str
     groq_stt_model: str = "whisper-large-v3"
     # Local disk on purpose: SQLite WAL/locking is unsafe on network shares (the repo lives on SMB)
@@ -29,6 +33,17 @@ class Settings(BaseSettings):
     @classmethod
     def _blank_author_is_none(cls, value: object) -> object:
         return None if isinstance(value, str) and not value.strip() else value
+
+    @field_validator("admin_user_ids", mode="before")
+    @classmethod
+    def _split_admin_ids(cls, value: object) -> object:
+        if isinstance(value, str):
+            return [int(part) for part in value.replace(",", " ").split()]
+        return value
+
+    def seed_admin_ids(self) -> list[int]:
+        ids = [self.author_user_id] if self.author_user_id is not None else []
+        return list(dict.fromkeys([*ids, *self.admin_user_ids]))
 
 
 def _pointer_files(local_env: Path) -> list[Path]:

@@ -6,7 +6,7 @@ from tests.conftest import AUTHOR_ID, VIEWER_ID, FakeSpeech, FakeSummarizer, mak
 
 
 def _dp(storage):
-    return create_dispatcher(storage=storage, speech=FakeSpeech(), summarizer=FakeSummarizer(), author_id=AUTHOR_ID)
+    return create_dispatcher(storage=storage, speech=FakeSpeech(), summarizer=FakeSummarizer())
 
 
 async def test_text_saved_then_thumbs_up(bot, session, storage):
@@ -15,14 +15,22 @@ async def test_text_saved_then_thumbs_up(bot, session, storage):
     assert [(i.kind, i.text, i.message_id, i.username) for i in items] == [("text", "Сделай видео про нейросети", 42, "ann")]
     [reaction] = session.reactions()
     assert reaction.message_id == 42
-    assert reaction.reaction == [ReactionTypeEmoji(emoji="👍")]
+    assert reaction.reaction == [ReactionTypeEmoji(emoji="👌")]
 
 
-async def test_save_failure_no_thumbs_up(bot, session, storage):
+async def test_save_failure_retried_silently(bot, session, storage):
+    from bot.handlers import Limits
+
     await storage.close()  # force DB error
-    await _dp(storage).feed_update(bot, make_update(text="идея"))
-    assert session.reactions() == []
-    assert session.sent_texts() == [texts.SAVE_FAILED]
+    dp = create_dispatcher(storage=storage, speech=FakeSpeech(), summarizer=FakeSummarizer(),
+                           limits=Limits(burst_s=0, stt_retry_s=0.05))
+    await dp.feed_update(bot, make_update(text="идея", message_id=4))
+    assert session.reactions() == [] and session.sent_texts() == []
+    await storage.open()  # database is back
+    await dp["intake"].drain()
+    assert [i.text for i in await storage.list_all()] == ["идея"]
+    assert [r.message_id for r in session.reactions()] == [4]
+    assert session.sent_to(VIEWER_ID) == []
 
 
 async def test_group_messages_ignored(bot, session, storage):

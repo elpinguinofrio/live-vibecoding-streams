@@ -27,3 +27,8 @@ async def test_expands_home(tmp_path, monkeypatch):
 async def test_unsafe_unique_id_characters_are_sanitized(tmp_path):
     path = await VoiceArchive(tmp_path).save(b"x", chat_id=1, message_id=2, file_unique_id="../../evil")
     assert Path(path).parent == tmp_path
+
+
+async def test_save_uses_given_extension(tmp_path):
+    path = await VoiceArchive(tmp_path).save(b"mp4", chat_id=1, message_id=2, file_unique_id="u", ext="mp4")
+    assert Path(path).name == "1_2_u.mp4"

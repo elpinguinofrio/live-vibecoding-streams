@@ -1,5 +1,6 @@
 import asyncio
 import json
+from dataclasses import dataclass
 from typing import Any
 
 TELEGRAM_LIMIT = 4096
@@ -34,6 +35,37 @@ PROMPT_FINAL_FROM_PARTIALS = (
     "количество и 1-2 характерных примера. Отсортируй темы по количеству, по убыванию. "
     f"{_UNTRUSTED} {_FORMAT}"
 )
+# Reactions a bot may set (Bot API ReactionTypeEmoji); the model must pick one of these
+ALLOWED_REACTIONS = ("👍", "❤", "🔥", "👏", "😁", "🤔", "🤯", "🎉", "🤩", "🙏", "👌", "💯", "🤣", "🏆", "👀",
+                     "🤝", "🫡", "😎", "🤗", "✍")
+DEFAULT_REACTION = "👍"
+PROMPT_ASSIST = (
+    "Ты помогаешь автору контента разбирать сообщения зрителей. Ответь строго одним JSON-объектом с ключами: "
+    "\"tldr\" — о чём сообщение и чего хочет человек, 1–3 предложения, не более 500 символов, по-русски; "
+    f"\"emoji\" — одна реакция, подходящая к сообщению, строго одна из: {' '.join(ALLOWED_REACTIONS)}; "
+    "\"reply\" — короткий дружелюбный ответ зрителю от имени автора канала, на языке зрителя, "
+    "1–2 предложения, без обещаний. "
+    f"{_UNTRUSTED}"
+)
+ASSIST_INPUT_CHARS = 12000
+TLDR_OUTPUT_LIMIT = 700  # safety cap if the model ignores the length request
+REPLY_OUTPUT_LIMIT = 1000
+
+
+@dataclass(frozen=True)
+class Assist:
+    tldr: str
+    emoji: str
+    reply: str
+
+
+def _parse_object(raw: str) -> dict:
+    start, end = raw.find("{"), raw.rfind("}")
+    try:
+        data = json.loads(raw[start:end + 1]) if start != -1 and end > start else {}
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def utf16_len(text: str) -> int:
@@ -94,6 +126,15 @@ class GroqSummarizer:
         self._batch_chars = batch_chars
         self._item_chars = min(item_chars, batch_chars // 2 - 4)
         self._semaphore = asyncio.Semaphore(concurrency)
+
+    async def assist(self, text: str) -> Assist:
+        """One call per admin notification: TLDR, a fitting reaction and a draft reply. Empty fields if unparseable."""
+        data = _parse_object(await self._call(PROMPT_ASSIST, [text[:ASSIST_INPUT_CHARS]]))
+        tldr = str(data.get("tldr") or "").strip().removeprefix("TLDR:").strip()
+        emoji = str(data.get("emoji") or "").strip()
+        return Assist(tldr=truncate_utf16(tldr, TLDR_OUTPUT_LIMIT),
+                      emoji=emoji if emoji in ALLOWED_REACTIONS else DEFAULT_REACTION,
+                      reply=truncate_utf16(str(data.get("reply") or "").strip(), REPLY_OUTPUT_LIMIT))
 
     async def summarize(self, texts: list[str]) -> str:
         items = [t[: self._item_chars] for t in texts]

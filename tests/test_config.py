@@ -88,3 +88,15 @@ def test_db_default_is_local_home_path(monkeypatch):
     _env(monkeypatch)
     s = Settings(_env_file=None)
     assert s.db_path.startswith("~/")
+
+
+def test_admin_ids_comma_separated(monkeypatch):
+    _env(monkeypatch)
+    monkeypatch.setenv("ADMIN_USER_IDS", "6901813140, 188200615")
+    assert Settings(_env_file=None).admin_user_ids == [6901813140, 188200615]
+
+
+def test_admin_ids_default_empty(monkeypatch):
+    _env(monkeypatch)
+    monkeypatch.delenv("ADMIN_USER_IDS", raising=False)
+    assert Settings(_env_file=None).admin_user_ids == []
