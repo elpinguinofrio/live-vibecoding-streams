@@ -9,7 +9,7 @@ from aiogram.client.session.base import BaseSession
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.methods import (AnswerCallbackQuery, CopyMessage, DeleteMyCommands, EditMessageReplyMarkup, GetFile,
                              SendMessage, SetMessageReaction, SetMyCommands, TelegramMethod)
-from aiogram.types import CallbackQuery, Chat, Document, File, Message, MessageId, PhotoSize, Update, User, Video, VideoNote, Voice
+from aiogram.types import CallbackQuery, Chat, Document, MessageReactionUpdated, ReactionTypeEmoji, File, Message, MessageId, PhotoSize, Update, User, Video, VideoNote, Voice
 
 from bot.storage import Storage
 from bot.summary import Assist
@@ -184,6 +184,17 @@ def make_callback(user_id: int, message_id: int, data: str) -> Update:
         data=data, message=Message(message_id=message_id, date=datetime.now(timezone.utc),
                                    chat=Chat(id=user_id, type="private"),
                                    from_user=User(id=42, is_bot=True, first_name="Bot"), text="🆕 …")))
+
+
+def make_reaction(user_id: int, message_id: int, new: list[str], old: list[str] | None = None) -> Update:
+    """A viewer changing their reaction on message message_id in their private chat with the bot."""
+    global _update_id
+    _update_id += 1
+    return Update(update_id=_update_id, message_reaction=MessageReactionUpdated(
+        chat=Chat(id=user_id, type="private"), message_id=message_id, date=datetime.now(timezone.utc),
+        user=User(id=user_id, is_bot=False, first_name="Ann", username="ann"),
+        old_reaction=[ReactionTypeEmoji(emoji=e) for e in (old or [])],
+        new_reaction=[ReactionTypeEmoji(emoji=e) for e in new]))
 
 
 @pytest.fixture

@@ -130,9 +130,28 @@ async def _admin_plain_message(message: Message, storage: Storage) -> dict | boo
         return False
 
 
-async def _relay(message: Message, bot: Bot, notification: Notification) -> None:
+PREVIEW_CHARS = 60
+_MEDIA_LABELS = {"voice": "голосовое", "video_note": "кружок", "video": "видео", "photo": "фото", "sticker": "стикер"}
+
+
+def _preview(message: Message) -> str:
+    text = (message.text or message.caption or "").strip()
+    if not text:
+        text = next((label for attr, label in _MEDIA_LABELS.items() if getattr(message, attr, None)), "сообщение")
+    return text if len(text) <= PREVIEW_CHARS else text[:PREVIEW_CHARS - 1] + "…"
+
+
+async def _remember_outgoing(storage: Storage, notification: Notification, message_id: int, preview: str) -> None:
+    try:
+        await storage.add_outgoing(viewer_chat_id=notification.user_chat_id, message_id=message_id,
+                                   source_message_ids=notification.source_message_ids, preview=preview)
+    except Exception as exc:  # only reaction context is lost
+        log.error("failed to remember outgoing message: %s", type(exc).__name__)
+
+
+async def _relay(message: Message, bot: Bot, notification: Notification, storage: Storage) -> None:
     try:  # copy, not forward: the person sees the bot, never the admin
-        await bot.copy_message(
+        sent = await bot.copy_message(
             chat_id=notification.user_chat_id, from_chat_id=message.chat.id, message_id=message.message_id,
             reply_parameters=ReplyParameters(message_id=notification.source_message_ids[-1],
                                              allow_sending_without_reply=True)
@@ -142,6 +161,7 @@ async def _relay(message: Message, bot: Bot, notification: Notification) -> None
         log.error("failed to relay admin reply: %s", type(exc).__name__)
         await _answer_safely(message, texts.RELAY_FAILED)
         return
+    await _remember_outgoing(storage, notification, sent.message_id, _preview(message))
     try:
         await message.react(OK_HAND)
     except Exception:
@@ -168,7 +188,7 @@ def create_router(limits: Limits) -> Router:
     router.message.filter(F.chat.type == ChatType.PRIVATE)
 
     @router.message(_notification_reply)
-    async def on_notification_reply(message: Message, bot: Bot, notification: Notification) -> None:
+    async def on_notification_reply(message: Message, bot: Bot, storage: Storage, notification: Notification) -> None:
         if _is_command(message, "original"):
             if not notification.source_message_ids:
                 await _answer_safely(message, texts.ORIGINAL_FAILED)
@@ -182,14 +202,35 @@ def create_router(limits: Limits) -> Router:
                     await _answer_safely(message, texts.ORIGINAL_FAILED)
                     return
             return
-        await _relay(message, bot, notification)
+        await _relay(message, bot, notification, storage)
 
-    @router.message_reaction()
-    async def on_reaction(event: MessageReactionUpdated) -> None:
-        # SPIKE: does Telegram deliver viewer reactions in private chats at all?
-        log.info("REACTION chat=%s message=%s old=%s new=%s", event.chat.id, event.message_id,
-                 [getattr(r, "emoji", r.type) for r in event.old_reaction],
-                 [getattr(r, "emoji", r.type) for r in event.new_reaction])
+    @router.message_reaction(F.chat.type == ChatType.PRIVATE)
+    async def on_reaction(event: MessageReactionUpdated, bot: Bot, storage: Storage) -> None:
+        """A viewer reacted to a message in their chat with the bot: tell every admin."""
+        emojis = lambda rs: [getattr(r, "emoji", None) or "⭐" for r in rs]  # noqa: E731 (custom/paid → ⭐)
+        new, old = emojis(event.new_reaction), emojis(event.old_reaction)
+        try:
+            if event.user is None or await storage.is_admin(event.user.id):
+                return
+            sender = f"@{event.user.username} (id {event.user.id})" if event.user.username \
+                else f"{event.user.full_name} (id {event.user.id})"
+            outgoing = await storage.get_outgoing(event.chat.id, event.message_id)
+            target = (texts.REACTION_TARGET_ANSWER.format(preview=outgoing[1]) if outgoing
+                      else texts.REACTION_TARGET_OTHER)
+            note = (texts.REACTION_NEW.format(emoji=" ".join(new), sender=sender, target=target) if new
+                    else texts.REACTION_REMOVED.format(emoji=" ".join(old), sender=sender, target=target))
+            under = await storage.notifications_for(event.chat.id, outgoing[0]) if outgoing else {}
+            admin_ids = await storage.admin_ids()
+        except Exception as exc:
+            log.error("failed to handle reaction: %s", type(exc).__name__)
+            return
+        for admin_id in admin_ids:
+            try:
+                reply = ReplyParameters(message_id=under[admin_id], allow_sending_without_reply=True) \
+                    if admin_id in under else None
+                await bot.send_message(admin_id, note, reply_parameters=reply)
+            except Exception as exc:
+                log.error("failed to report reaction: %s", type(exc).__name__)
 
     @router.callback_query(F.data.in_({"react", "draft"}))
     async def on_quick_action(callback: CallbackQuery, bot: Bot, storage: Storage) -> None:
@@ -208,9 +249,10 @@ def create_router(limits: Limits) -> Router:
                                                reaction=[ReactionTypeEmoji(emoji=notification.emoji or "👍")])
                 remaining = keyboard(None, notification.draft)
             else:
-                await bot.send_message(notification.user_chat_id, notification.draft,
-                                       reply_parameters=ReplyParameters(message_id=target,
-                                                                        allow_sending_without_reply=True))
+                sent = await bot.send_message(notification.user_chat_id, notification.draft,
+                                              reply_parameters=ReplyParameters(message_id=target,
+                                                                               allow_sending_without_reply=True))
+                await _remember_outgoing(storage, notification, sent.message_id, notification.draft[:PREVIEW_CHARS])
                 remaining = keyboard(notification.emoji, None)
         except Exception as exc:
             log.error("quick action %s failed: %s", callback.data, type(exc).__name__)
@@ -331,11 +373,11 @@ def create_router(limits: Limits) -> Router:
             await _answer_safely(message, texts.ADMIN_MISSING.format(who=who))
 
     @router.message(_admin_plain_message)
-    async def on_admin_plain(message: Message, bot: Bot, notification: Notification | None) -> None:
+    async def on_admin_plain(message: Message, bot: Bot, storage: Storage, notification: Notification | None) -> None:
         if notification is None:
             await _answer_safely(message, texts.ADMIN_NO_TARGET)
             return
-        await _relay(message, bot, notification)
+        await _relay(message, bot, notification, storage)
 
     @router.message(F.text & ~F.text.startswith("/"))
     async def on_text(message: Message, bot: Bot, intake: Intake) -> None:

@@ -66,6 +66,16 @@ _SCHEMA = (
     )
     """,
 )
+_OUTGOING = """
+    CREATE TABLE IF NOT EXISTS outgoing (
+        viewer_chat_id INTEGER NOT NULL,
+        message_id INTEGER NOT NULL,
+        source_message_ids TEXT NOT NULL,
+        preview TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (viewer_chat_id, message_id)
+    )
+"""  # admin answers the bot sent to viewers: a viewer's reaction on one is reported under its notification
 _JOB_COLUMNS = ("chat_id", "message_id", "user_id", "username", "sender", "kind", "caption", "file_id",
                 "file_unique_id", "duration", "attempts")
 # Columns added after v0; ensured on open so older databases keep working (voice_* also hold video/photo ids)
@@ -123,7 +133,7 @@ class Storage:
         self._db = await aiosqlite.connect(self.path)
         await self._db.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
         await self._db.execute("PRAGMA journal_mode = WAL")
-        for statement in _SCHEMA:
+        for statement in (*_SCHEMA, _OUTGOING):
             await self._db.execute(statement)
         for table, columns in _ADDED_COLUMNS.items():
             existing = {row[1] for row in await (await self._db.execute(f"PRAGMA table_info({table})")).fetchall()}
@@ -316,3 +326,29 @@ class Storage:
     async def list_by_user(self, user_id: int) -> list[Suggestion]:
         cur = await self._conn().execute(f"SELECT {_COLUMNS} FROM suggestions WHERE user_id = ? ORDER BY id", (user_id,))
         return [Suggestion(*row) for row in await cur.fetchall()]
+
+    async def add_outgoing(self, *, viewer_chat_id: int, message_id: int, source_message_ids: list[int],
+                           preview: str) -> None:
+        db = self._conn()
+        await db.execute(
+            "INSERT OR REPLACE INTO outgoing (viewer_chat_id, message_id, source_message_ids, preview, created_at)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (viewer_chat_id, message_id, json.dumps(source_message_ids), preview, _now()),
+        )
+        await db.commit()
+
+    async def get_outgoing(self, viewer_chat_id: int, message_id: int) -> tuple[list[int], str] | None:
+        cur = await self._conn().execute(
+            "SELECT source_message_ids, preview FROM outgoing WHERE viewer_chat_id = ? AND message_id = ?",
+            (viewer_chat_id, message_id),
+        )
+        row = await cur.fetchone()
+        return (json.loads(row[0]), row[1]) if row else None
+
+    async def notifications_for(self, user_chat_id: int, source_message_ids: list[int]) -> dict[int, int]:
+        """admin_chat_id -> message_id of each admin's notification about these viewer messages."""
+        cur = await self._conn().execute(
+            "SELECT admin_chat_id, message_id FROM notifications WHERE user_chat_id = ? AND source_message_ids = ?",
+            (user_chat_id, json.dumps(source_message_ids)),
+        )
+        return {row[0]: row[1] for row in await cur.fetchall()}

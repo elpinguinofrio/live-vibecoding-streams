@@ -40,6 +40,7 @@ Don't do automatic thumbs up like never. And admin, like by default, have abilit
   - reply to the notification, or
   - just send the next message: it goes to the person from your latest notification.
 - Or do nothing — the person only sees 👌.
+- A viewer's reaction on any bot message → every admin gets «😁 @user — реакция на ваш ответ «…»», as a reply to their notification when known. Removed reactions too.
 - `/original` as a reply → the person's original messages.
 - `/summary` → all suggestions grouped by topic.
 - `/version`, `/whoami` work for everyone but are shown only in the admin menu.
