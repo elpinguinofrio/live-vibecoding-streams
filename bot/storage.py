@@ -82,6 +82,7 @@ _JOB_COLUMNS = ("chat_id", "message_id", "user_id", "username", "sender", "kind"
 _ADDED_COLUMNS = {
     "suggestions": {"voice_path": "TEXT", "voice_file_id": "TEXT", "stt_model": "TEXT"},
     "notifications": {"emoji": "TEXT", "draft": "TEXT"},
+    "outgoing": {"admin_chat_id": "INTEGER", "admin_message_id": "INTEGER"},
 }
 _COLUMNS = "id, user_id, username, kind, text, chat_id, message_id, created_at, voice_path, voice_file_id, stt_model"
 
@@ -328,27 +329,26 @@ class Storage:
         return [Suggestion(*row) for row in await cur.fetchall()]
 
     async def add_outgoing(self, *, viewer_chat_id: int, message_id: int, source_message_ids: list[int],
-                           preview: str) -> None:
+                           preview: str, admin_chat_id: int, admin_message_id: int) -> None:
+        """admin_message_id: where a viewer's reaction is mirrored — the admin's own answer, or the notification
+        whose draft button sent it."""
         db = self._conn()
         await db.execute(
-            "INSERT OR REPLACE INTO outgoing (viewer_chat_id, message_id, source_message_ids, preview, created_at)"
-            " VALUES (?, ?, ?, ?, ?)",
-            (viewer_chat_id, message_id, json.dumps(source_message_ids), preview, _now()),
+            "INSERT OR REPLACE INTO outgoing (viewer_chat_id, message_id, source_message_ids, preview, created_at,"
+            " admin_chat_id, admin_message_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (viewer_chat_id, message_id, json.dumps(source_message_ids), preview, _now(), admin_chat_id,
+             admin_message_id),
         )
         await db.commit()
 
-    async def get_outgoing(self, viewer_chat_id: int, message_id: int) -> tuple[list[int], str] | None:
+    async def get_outgoing(self, viewer_chat_id: int, message_id: int) -> dict | None:
         cur = await self._conn().execute(
-            "SELECT source_message_ids, preview FROM outgoing WHERE viewer_chat_id = ? AND message_id = ?",
+            "SELECT source_message_ids, preview, admin_chat_id, admin_message_id FROM outgoing"
+            " WHERE viewer_chat_id = ? AND message_id = ?",
             (viewer_chat_id, message_id),
         )
         row = await cur.fetchone()
-        return (json.loads(row[0]), row[1]) if row else None
-
-    async def notifications_for(self, user_chat_id: int, source_message_ids: list[int]) -> dict[int, int]:
-        """admin_chat_id -> message_id of each admin's notification about these viewer messages."""
-        cur = await self._conn().execute(
-            "SELECT admin_chat_id, message_id FROM notifications WHERE user_chat_id = ? AND source_message_ids = ?",
-            (user_chat_id, json.dumps(source_message_ids)),
-        )
-        return {row[0]: row[1] for row in await cur.fetchall()}
+        if row is None:
+            return None
+        return {"source_message_ids": json.loads(row[0]), "preview": row[1], "admin_chat_id": row[2],
+                "admin_message_id": row[3]}

@@ -141,10 +141,12 @@ def _preview(message: Message) -> str:
     return text if len(text) <= PREVIEW_CHARS else text[:PREVIEW_CHARS - 1] + "…"
 
 
-async def _remember_outgoing(storage: Storage, notification: Notification, message_id: int, preview: str) -> None:
+async def _remember_outgoing(storage: Storage, notification: Notification, message_id: int, preview: str,
+                             admin_chat_id: int, admin_message_id: int) -> None:
     try:
         await storage.add_outgoing(viewer_chat_id=notification.user_chat_id, message_id=message_id,
-                                   source_message_ids=notification.source_message_ids, preview=preview)
+                                   source_message_ids=notification.source_message_ids, preview=preview,
+                                   admin_chat_id=admin_chat_id, admin_message_id=admin_message_id)
     except Exception as exc:  # only reaction context is lost
         log.error("failed to remember outgoing message: %s", type(exc).__name__)
 
@@ -161,7 +163,8 @@ async def _relay(message: Message, bot: Bot, notification: Notification, storage
         log.error("failed to relay admin reply: %s", type(exc).__name__)
         await _answer_safely(message, texts.RELAY_FAILED)
         return
-    await _remember_outgoing(storage, notification, sent.message_id, _preview(message))
+    await _remember_outgoing(storage, notification, sent.message_id, _preview(message),
+                             admin_chat_id=message.chat.id, admin_message_id=message.message_id)
     try:
         await message.react(OK_HAND)
     except Exception:
@@ -206,28 +209,41 @@ def create_router(limits: Limits) -> Router:
 
     @router.message_reaction(F.chat.type == ChatType.PRIVATE)
     async def on_reaction(event: MessageReactionUpdated, bot: Bot, storage: Storage) -> None:
-        """A viewer reacted to a message in their chat with the bot: tell every admin."""
+        """A viewer reacted in their chat with the bot. On an admin's answer: mirror the emoji onto that admin's own
+        message (👌 again when removed). Anything else, or if Telegram refuses the emoji: a short note instead."""
         emojis = lambda rs: [getattr(r, "emoji", None) or "⭐" for r in rs]  # noqa: E731 (custom/paid → ⭐)
         new, old = emojis(event.new_reaction), emojis(event.old_reaction)
         try:
             if event.user is None or await storage.is_admin(event.user.id):
                 return
-            sender = f"@{event.user.username} (id {event.user.id})" if event.user.username \
-                else f"{event.user.full_name} (id {event.user.id})"
             outgoing = await storage.get_outgoing(event.chat.id, event.message_id)
-            target = (texts.REACTION_TARGET_ANSWER.format(preview=outgoing[1]) if outgoing
-                      else texts.REACTION_TARGET_OTHER)
-            note = (texts.REACTION_NEW.format(emoji=" ".join(new), sender=sender, target=target) if new
-                    else texts.REACTION_REMOVED.format(emoji=" ".join(old), sender=sender, target=target))
-            under = await storage.notifications_for(event.chat.id, outgoing[0]) if outgoing else {}
-            admin_ids = await storage.admin_ids()
         except Exception as exc:
             log.error("failed to handle reaction: %s", type(exc).__name__)
             return
-        for admin_id in admin_ids:
+        if outgoing and outgoing["admin_message_id"]:
             try:
-                reply = ReplyParameters(message_id=under[admin_id], allow_sending_without_reply=True) \
-                    if admin_id in under else None
+                mirror = [ReactionTypeEmoji(emoji=new[-1])] if new else OK_HAND  # bots show one reaction
+                await bot.set_message_reaction(chat_id=outgoing["admin_chat_id"],
+                                               message_id=outgoing["admin_message_id"], reaction=mirror)
+                return
+            except Exception as exc:  # e.g. an emoji bots may not set
+                log.warning("failed to mirror reaction: %s", type(exc).__name__)
+        user = event.user
+        sender = f"@{user.username} (id {user.id})" if user.username else f"{user.full_name} (id {user.id})"
+        target = (texts.REACTION_TARGET_ANSWER.format(preview=outgoing["preview"]) if outgoing
+                  else texts.REACTION_TARGET_OTHER)
+        note = (texts.REACTION_NEW.format(emoji=" ".join(new), sender=sender, target=target) if new
+                else texts.REACTION_REMOVED.format(emoji=" ".join(old), sender=sender, target=target))
+        try:  # a mirrorable answer that failed: tell its admin, under their answer; otherwise tell everyone
+            recipients = ({outgoing["admin_chat_id"]: outgoing["admin_message_id"]}
+                          if outgoing and outgoing["admin_message_id"]
+                          else {admin_id: None for admin_id in await storage.admin_ids()})
+        except Exception as exc:
+            log.error("failed to read admins: %s", type(exc).__name__)
+            return
+        for admin_id, under in recipients.items():
+            try:
+                reply = ReplyParameters(message_id=under, allow_sending_without_reply=True) if under else None
                 await bot.send_message(admin_id, note, reply_parameters=reply)
             except Exception as exc:
                 log.error("failed to report reaction: %s", type(exc).__name__)
@@ -252,7 +268,8 @@ def create_router(limits: Limits) -> Router:
                 sent = await bot.send_message(notification.user_chat_id, notification.draft,
                                               reply_parameters=ReplyParameters(message_id=target,
                                                                                allow_sending_without_reply=True))
-                await _remember_outgoing(storage, notification, sent.message_id, notification.draft[:PREVIEW_CHARS])
+                await _remember_outgoing(storage, notification, sent.message_id, notification.draft[:PREVIEW_CHARS],
+                                         admin_chat_id=note.chat.id, admin_message_id=note.message_id)
                 remaining = keyboard(notification.emoji, None)
         except Exception as exc:
             log.error("quick action %s failed: %s", callback.data, type(exc).__name__)

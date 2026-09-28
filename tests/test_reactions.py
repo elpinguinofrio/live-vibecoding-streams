@@ -4,9 +4,6 @@ from bot import texts
 from bot.handlers import Limits, create_dispatcher
 from tests.conftest import AUTHOR_ID, VIEWER_ID, FakeSpeech, FakeSummarizer, make_reaction, make_update
 
-SECOND_ADMIN = 300
-
-
 def _dp(storage):
     return create_dispatcher(storage=storage, speech=FakeSpeech(), summarizer=FakeSummarizer(),
                              limits=Limits(burst_s=0))
@@ -16,20 +13,54 @@ def _sends(session, chat_id):
     return [(i, m) for i, m in enumerate(session.requests) if isinstance(m, SendMessage) and m.chat_id == chat_id]
 
 
-async def test_viewer_reaction_on_admin_answer_reaches_every_admin_under_their_notification(bot, session, storage):
-    await storage.add_admin(SECOND_ADMIN, "bob", added_by=AUTHOR_ID)
+async def _answer_and_copy(dp, bot, session):
+    """Viewer suggests, admin answers it; returns the id of the bot's copy in the viewer chat."""
+    await dp.feed_update(bot, make_update(text="идея", message_id=70))
+    note_id = _sends(session, AUTHOR_ID)[-1][0] + 1 + 1000
+    await dp.feed_update(bot, make_update(user_id=AUTHOR_ID, text="спасибо, сделаем", message_id=900,
+                                          reply_to=note_id))
+    copy = session.copies()[-1]
+    return session.requests.index(copy) + 1 + 5000, note_id
+
+
+async def test_viewer_reaction_mirrored_on_admins_own_answer(bot, session, storage):
+    dp = _dp(storage)
+    copied_id, _ = await _answer_and_copy(dp, bot, session)
+    sends_before = len(session.calls(SendMessage))
+    await dp.feed_update(bot, make_reaction(VIEWER_ID, copied_id, new=["😁"]))
+    mirror = session.reactions()[-1]
+    assert (mirror.chat_id, mirror.message_id, mirror.reaction[0].emoji) == (AUTHOR_ID, 900, "😁")
+    assert len(session.calls(SendMessage)) == sends_before  # no extra message
+
+
+async def test_removed_reaction_puts_ok_hand_back(bot, session, storage):
+    dp = _dp(storage)
+    copied_id, _ = await _answer_and_copy(dp, bot, session)
+    await dp.feed_update(bot, make_reaction(VIEWER_ID, copied_id, new=[], old=["😁"]))
+    mirror = session.reactions()[-1]
+    assert (mirror.chat_id, mirror.message_id, mirror.reaction[0].emoji) == (AUTHOR_ID, 900, "👌")
+
+
+async def test_reaction_on_sent_draft_mirrored_on_notification(bot, session, storage):
+    from tests.conftest import make_callback
     dp = _dp(storage)
     await dp.feed_update(bot, make_update(text="идея", message_id=70))
-    notes = {a: _sends(session, a)[-1][0] + 1 + 1000 for a in (AUTHOR_ID, SECOND_ADMIN)}
-    await dp.feed_update(bot, make_update(user_id=AUTHOR_ID, text="спасибо, сделаем", message_id=900,
-                                          reply_to=notes[AUTHOR_ID]))
-    [copy] = session.copies()
-    copied_id = session.requests.index(copy) + 1 + 5000
-    await dp.feed_update(bot, make_reaction(VIEWER_ID, copied_id, new=["😁"]))
-    for admin, note_id in notes.items():
-        _, msg = _sends(session, admin)[-1]
-        assert "😁" in msg.text and "@ann" in msg.text and "спасибо, сделаем" in msg.text
-        assert msg.reply_parameters.message_id == note_id
+    note_id = _sends(session, AUTHOR_ID)[-1][0] + 1 + 1000
+    await dp.feed_update(bot, make_callback(AUTHOR_ID, note_id, "draft"))
+    draft_id = _sends(session, VIEWER_ID)[-1][0] + 1 + 1000
+    await dp.feed_update(bot, make_reaction(VIEWER_ID, draft_id, new=["🔥"]))
+    mirror = session.reactions()[-1]
+    assert (mirror.chat_id, mirror.message_id, mirror.reaction[0].emoji) == (AUTHOR_ID, note_id, "🔥")
+
+
+async def test_refused_emoji_falls_back_to_message_under_notification(bot, session, storage):
+    dp = _dp(storage)
+    copied_id, note_id = await _answer_and_copy(dp, bot, session)
+    session.fail_reaction = True
+    await dp.feed_update(bot, make_reaction(VIEWER_ID, copied_id, new=["🦖"]))
+    _, msg = _sends(session, AUTHOR_ID)[-1]
+    assert "🦖" in msg.text and "спасибо, сделаем" in msg.text
+    assert msg.reply_parameters.message_id == 900
 
 
 async def test_reaction_on_other_bot_message_still_reported(bot, session, storage):
