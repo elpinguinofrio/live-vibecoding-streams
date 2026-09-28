@@ -8,7 +8,7 @@ from typing import Protocol
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ChatType
 from aiogram.filters import Command, CommandObject, CommandStart
-from aiogram.types import CallbackQuery, Message, ReactionTypeEmoji, ReplyParameters
+from aiogram.types import CallbackQuery, Message, MessageReactionUpdated, ReactionTypeEmoji, ReplyParameters
 
 from bot import texts
 from bot.commands import hide_admin_menu, show_admin_menu
@@ -183,6 +183,13 @@ def create_router(limits: Limits) -> Router:
                     return
             return
         await _relay(message, bot, notification)
+
+    @router.message_reaction()
+    async def on_reaction(event: MessageReactionUpdated) -> None:
+        # SPIKE: does Telegram deliver viewer reactions in private chats at all?
+        log.info("REACTION chat=%s message=%s old=%s new=%s", event.chat.id, event.message_id,
+                 [getattr(r, "emoji", r.type) for r in event.old_reaction],
+                 [getattr(r, "emoji", r.type) for r in event.new_reaction])
 
     @router.callback_query(F.data.in_({"react", "draft"}))
     async def on_quick_action(callback: CallbackQuery, bot: Bot, storage: Storage) -> None:

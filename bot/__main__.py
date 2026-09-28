@@ -56,7 +56,7 @@ async def main() -> None:
         stack.push_async_callback(dp["intake"].close)  # stop retries first; unfinished media stays queued in the DB
         await dp["intake"].resume(bot)
         await setup_commands(bot, admin_ids)
-        await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
+        await dp.start_polling(bot, allowed_updates=["message", "callback_query", "message_reaction"])
 
 
 if __name__ == "__main__":
