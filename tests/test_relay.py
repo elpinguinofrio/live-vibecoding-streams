@@ -211,3 +211,22 @@ async def test_legacy_looking_message_not_from_bot_is_ignored(bot, session, stor
                                                     reply_text=_legacy(), reply_from_bot=False))
     assert session.copies() == []  # not trusted as a legacy notification, and no other notification exists
     assert session.sent_to(AUTHOR_ID) == [texts.ADMIN_NO_TARGET]
+
+
+# --- global suggestion numbers in notifications ---
+
+async def test_notification_shows_global_suggestion_number(bot, session, storage):
+    dp = _dp(storage)
+    await dp.feed_update(bot, make_update(user_id=VIEWER_ID, text="первое", message_id=1))
+    await dp.feed_update(bot, make_update(user_id=555, text="второе", message_id=1))  # other user: numbering is global
+    first, second = session.sent_to(AUTHOR_ID)
+    assert first.startswith("🆕 #1 ") and second.startswith("🆕 #2 ")
+
+
+async def test_burst_shows_number_range(bot, session, storage):
+    dp = _dp(storage, burst_s=0.05)
+    for i in range(3):
+        await dp.feed_update(bot, make_update(text=f"часть {i}", message_id=50 + i))
+    await asyncio.sleep(0.2)
+    [note] = session.sent_to(AUTHOR_ID)
+    assert note.startswith("🆕 #1–3 ")
