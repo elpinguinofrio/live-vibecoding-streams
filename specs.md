@@ -49,4 +49,4 @@ Don't do automatic thumbs up like never. And admin, like by default, have abilit
 
 - «принимает только текст»: should the bot *say* it accepts only text, or *accept* only text for now?
 - `/status` (count of suggestions and users) — in product.md, not built.
-- Auto-start after reboot / restart on crash — today it runs in tmux session `streaming-poll-tg-bot` and stays down if it crashes.
+- Auto-start after reboot / restart on crash — today the bots run in tmux sessions `audience_topic_inbox_bot` (test) and `el_ping_bot` (prod) and stay down if they crash.

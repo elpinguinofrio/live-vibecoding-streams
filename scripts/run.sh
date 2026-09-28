@@ -3,7 +3,7 @@
 # Production is deployed from master with scripts/deploy.sh.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-session=streaming-poll-tg-bot
+session=audience_topic_inbox_bot
 mkdir -p logs
 cmd="uv run python -m bot 2>&1 | tee -a logs/bot.log"
 if tmux has-session -t "$session" 2>/dev/null; then

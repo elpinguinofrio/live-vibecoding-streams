@@ -4,7 +4,7 @@
 set -euo pipefail
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 prod="$HOME/deploy/streaming-poll-tg-bot-prod"
-session=streaming-poll-tg-bot-prod
+session=el_ping_bot
 env_file="$HOME/.config/streaming-poll-tg-bot/prod.env"  # TELEGRAM_BOT_TOKEN + DB_PATH of the prod bot
 [ -f "$env_file" ] || { echo "missing $env_file" >&2; exit 1; }
 
